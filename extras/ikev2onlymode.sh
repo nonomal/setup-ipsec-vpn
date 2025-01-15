@@ -2,7 +2,7 @@
 #
 # Script to enable or disable IKEv2-only mode
 #
-# Copyright (C) 2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2022-2024 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -59,7 +59,7 @@ EOF
   if ! check_ikev2_exists; then
 cat 1>&2 <<'EOF'
 Error: Your must first set up IKEv2 before selecting IKEv2-only mode.
-       See: https://git.io/ikev2
+       See: https://vpnsetup.net/ikev2
 EOF
     exit 1
   fi
@@ -71,7 +71,7 @@ cat 1>&2 <<EOF
 Error: Libreswan version '$swan_ver' is not supported.
        IKEv2-only mode requires Libreswan 4.2 or newer.
        To update Libreswan, run:
-       wget https://git.io/vpnupgrade -qO vpnup.sh && sudo sh vpnup.sh
+       wget https://get.vpnsetup.net/upg -O vpnup.sh && sudo sh vpnup.sh
 EOF
     exit 1
   fi
@@ -116,6 +116,7 @@ toggle_ikev2_only() {
     confirm_disable_ikev2_only
     bigecho "Disabling IKEv2-only mode..."
     sed -i".old-$SYS_DT" "/ikev1-policy=/d" /etc/ipsec.conf
+    sed -i "/config setup/a \  ikev1-policy=accept" /etc/ipsec.conf
   elif [ "$ikev2_only_status" = "DISABLED" ]; then
     confirm_enable_ikev2_only
     bigecho "Enabling IKEv2-only mode..."

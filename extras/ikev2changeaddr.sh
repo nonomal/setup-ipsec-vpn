@@ -5,7 +5,7 @@
 # The latest version of this script is available at:
 # https://github.com/hwdsl2/setup-ipsec-vpn
 #
-# Copyright (C) 2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2022-2024 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -36,55 +36,16 @@ check_root() {
 }
 
 check_os() {
-  os_type=centos
-  rh_file="/etc/redhat-release"
-  if grep -qs "Red Hat" "$rh_file"; then
-    os_type=rhel
-  fi
-  if grep -qs "release 7" "$rh_file"; then
-    os_ver=7
-  elif grep -qs "release 8" "$rh_file"; then
-    os_ver=8
-    grep -qi stream "$rh_file" && os_ver=8s
-    grep -qi rocky "$rh_file" && os_type=rocky
-    grep -qi alma "$rh_file" && os_type=alma
-  elif grep -qs "Amazon Linux release 2" /etc/system-release; then
-    os_type=amzn
-    os_ver=2
-  else
-    os_type=$(lsb_release -si 2>/dev/null)
-    [ -z "$os_type" ] && [ -f /etc/os-release ] && os_type=$(. /etc/os-release && printf '%s' "$ID")
-    case $os_type in
-      [Uu]buntu)
-        os_type=ubuntu
-        ;;
-      [Dd]ebian)
-        os_type=debian
-        ;;
-      [Rr]aspbian)
-        os_type=raspbian
-        ;;
-      [Aa]lpine)
-        os_type=alpine
-        ;;
-      *)
-cat 1>&2 <<'EOF'
-Error: This script only supports one of the following OS:
-       Ubuntu, Debian, CentOS/RHEL 7/8, Rocky Linux, AlmaLinux,
-       Amazon Linux 2 or Alpine Linux
-EOF
-        exit 1
-        ;;
-    esac
-    if [ "$os_type" = "alpine" ]; then
-      os_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID" | cut -d '.' -f 1,2)
-      if [ "$os_ver" != "3.14" ] && [ "$os_ver" != "3.15" ]; then
-        exiterr "This script only supports Alpine Linux 3.14/3.15."
-      fi
-    else
-      os_ver=$(sed 's/\..*//' /etc/debian_version | tr -dc 'A-Za-z0-9')
-    fi
-  fi
+  os_type=$(lsb_release -si 2>/dev/null)
+  [ -z "$os_type" ] && [ -f /etc/os-release ] && os_type=$(. /etc/os-release && printf '%s' "$ID")
+  case $os_type in
+    [Aa]lpine)
+      os_type=alpine
+      ;;
+    *)
+      os_type=other
+      ;;
+  esac
 }
 
 check_libreswan() {
@@ -103,7 +64,7 @@ check_ikev2() {
   if ! grep -qs "conn ikev2-cp" /etc/ipsec.d/ikev2.conf; then
 cat 1>&2 <<'EOF'
 Error: You must first set up IKEv2 before changing IKEv2 server address.
-       See: https://git.io/ikev2
+       See: https://vpnsetup.net/ikev2
 EOF
     exit 1
   fi
@@ -141,25 +102,35 @@ check_ca_cert_exists() {
 
 get_server_address() {
   server_addr_old=$(grep -s "leftcert=" /etc/ipsec.d/ikev2.conf | cut -f2 -d=)
-  [ -z "$server_addr_old" ] && server_addr_old=$(grep -s "leftcert=" /etc/ipsec.conf | cut -f2 -d=)
   check_ip "$server_addr_old" || check_dns_name "$server_addr_old" || exiterr "Could not get current VPN server address."
 }
 
 show_welcome() {
 cat <<EOF
-Welcome! Use this script to change this IKEv2 VPN server's address. A new server
-certificate will be generated if necessary.
+Welcome! Use this script to change this IKEv2 VPN server's address.
 
 Current server address: $server_addr_old
 
 EOF
 }
 
+get_default_ip() {
+  def_ip=$(ip -4 route get 1 | sed 's/ uid .*//' | awk '{print $NF;exit}' 2>/dev/null)
+  if check_ip "$def_ip" \
+    && ! printf '%s' "$def_ip" | grep -Eq '^(10|127|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168|169\.254)\.'; then
+    public_ip="$def_ip"
+  fi
+}
+
 get_server_ip() {
-  bigecho "Trying to auto discover IP of this server..."
+  use_default_ip=0
   public_ip=${VPN_PUBLIC_IP:-''}
+  check_ip "$public_ip" || get_default_ip
+  check_ip "$public_ip" && { use_default_ip=1; return 0; }
+  bigecho "Trying to auto discover IP of this server..."
   check_ip "$public_ip" || public_ip=$(dig @resolver1.opendns.com -t A -4 myip.opendns.com +short)
-  check_ip "$public_ip" || public_ip=$(wget -t 3 -T 15 -qO- http://ipv4.icanhazip.com)
+  check_ip "$public_ip" || public_ip=$(wget -t 2 -T 10 -qO- http://ipv4.icanhazip.com)
+  check_ip "$public_ip" || public_ip=$(wget -t 2 -T 10 -qO- http://ip1.dynupdate.no-ip.com)
 }
 
 enter_server_address() {
@@ -176,7 +147,7 @@ enter_server_address() {
       echo
       ;;
   esac
-  if [ "$use_dns_name" = "1" ]; then
+  if [ "$use_dns_name" = 1 ]; then
     read -rp "Enter the DNS name of this VPN server: " server_addr
     until check_dns_name "$server_addr"; do
       echo "Invalid DNS name. You must enter a fully qualified domain name (FQDN)."
@@ -184,7 +155,7 @@ enter_server_address() {
     done
   else
     get_server_ip
-    echo
+    [ "$use_default_ip" = 0 ] && echo
     read -rp "Enter the IPv4 address of this VPN server: [$public_ip] " server_addr
     [ -z "$server_addr" ] && server_addr="$public_ip"
     until check_ip "$server_addr"; do
@@ -207,7 +178,11 @@ confirm_changes() {
 cat <<EOF
 
 You are about to change this IKEv2 VPN server's address.
-Read the important notes below before continuing.
+
+*IMPORTANT* After running this script, you must manually update
+the server address (and remote ID, if applicable) on any existing
+IKEv2 client devices. For iOS clients, you'll need to export and
+re-import client configuration using the IKEv2 helper script.
 
 ===========================================
 
@@ -215,12 +190,6 @@ Current server address: $server_addr_old
 New server address:     $server_addr
 
 ===========================================
-
-*IMPORTANT*
-After running this script, you must manually update the server address
-(and remote ID, if applicable) on any existing IKEv2 client devices.
-For iOS clients, you'll need to export and re-import client configuration
-using the IKEv2 helper script.
 
 EOF
   printf "Do you want to continue? [Y/n] "
@@ -240,7 +209,7 @@ create_server_cert() {
     bigecho "Server certificate '$server_addr' already exists, skipping..."
   else
     bigecho "Generating server certificate..."
-    if [ "$use_dns_name" = "1" ]; then
+    if [ "$use_dns_name" = 1 ]; then
       certutil -z <(head -c 1024 /dev/urandom) \
         -S -c "IKEv2 VPN CA" -n "$server_addr" \
         -s "O=IKEv2 VPN,CN=$server_addr" \
@@ -271,12 +240,19 @@ update_ikev2_conf() {
   sed -i".old-$SYS_DT" \
       -e "/^[[:space:]]\+leftcert=/d" \
       -e "/^[[:space:]]\+leftid=/d" /etc/ipsec.d/ikev2.conf
-  if [ "$use_dns_name" = "1" ]; then
+  if [ "$use_dns_name" = 1 ]; then
     sed -i "/conn ikev2-cp/a \  leftid=@$server_addr" /etc/ipsec.d/ikev2.conf
   else
     sed -i "/conn ikev2-cp/a \  leftid=$server_addr" /etc/ipsec.d/ikev2.conf
   fi
   sed -i "/conn ikev2-cp/a \  leftcert=$server_addr" /etc/ipsec.d/ikev2.conf
+}
+
+update_ikev2_log() {
+  ikev2_log="/etc/ipsec.d/ikev2setup.log"
+  if [ -s "$ikev2_log" ]; then
+    sed -i "/VPN server address:/s/$server_addr_old/$server_addr/" "$ikev2_log"
+  fi
 }
 
 restart_ipsec_service() {
@@ -309,6 +285,7 @@ ikev2changeaddr() {
 
   create_server_cert
   update_ikev2_conf
+  update_ikev2_log
   if [ "$os_type" = "alpine" ]; then
     ipsec auto --replace ikev2-cp >/dev/null
   else

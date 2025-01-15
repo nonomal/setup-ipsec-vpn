@@ -5,7 +5,7 @@
 # The latest version of this script is available at:
 # https://github.com/hwdsl2/setup-ipsec-vpn
 #
-# Copyright (C) 2021-2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2021-2024 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -51,8 +51,8 @@ check_os() {
       ;;
   esac
   os_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID" | cut -d '.' -f 1,2)
-  if [ "$os_ver" != "3.14" ] && [ "$os_ver" != "3.15" ]; then
-    exiterr "This script only supports Alpine Linux 3.14/3.15."
+  if [ "$os_ver" != "3.19" ] && [ "$os_ver" != "3.20" ]; then
+    exiterr "This script only supports Alpine Linux 3.19/3.20."
   fi
 }
 
@@ -69,10 +69,10 @@ EOF
 }
 
 get_swan_ver() {
-  swan_ver_cur=4.6
+  swan_ver_cur=5.1
   base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
   swan_ver_url="$base_url/upg-v1-$os_type-$os_ver-swanver"
-  swan_ver_latest=$(wget -t 3 -T 15 -qO- "$swan_ver_url" | head -n 1)
+  swan_ver_latest=$(wget -t 2 -T 10 -qO- "$swan_ver_url" | head -n 1)
   if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$'; then
     swan_ver_cur="$swan_ver_latest"
   fi
@@ -80,6 +80,9 @@ get_swan_ver() {
 }
 
 check_swan_ver() {
+  if [ "$SWAN_VER" = "4.8" ] || [ "$SWAN_VER" = "4.13" ]; then
+    exiterr "Libreswan version $SWAN_VER is not supported."
+  fi
   if ! printf '%s\n%s' "4.5" "$SWAN_VER" | sort -C -V \
     || ! printf '%s\n%s' "$SWAN_VER" "$swan_ver_cur" | sort -C -V; then
 cat 1>&2 <<EOF
@@ -106,7 +109,6 @@ Note: This script will make the following changes to your VPN configuration:
       Your other VPN config files will not be modified.
 
 EOF
-
   if [ "$SWAN_VER" != "$swan_ver_cur" ]; then
 cat <<'EOF'
 WARNING: Older versions of Libreswan could contain known security vulnerabilities.
@@ -115,7 +117,6 @@ WARNING: Older versions of Libreswan could contain known security vulnerabilitie
 
 EOF
   fi
-
   if [ "$swan_ver_old" = "$SWAN_VER" ]; then
 cat <<EOF
 Note: You already have Libreswan version $SWAN_VER installed!
@@ -123,7 +124,6 @@ Note: You already have Libreswan version $SWAN_VER installed!
 
 EOF
   fi
-
   printf "Do you want to continue? [Y/n] "
   read -r response
   case $response in
@@ -146,8 +146,8 @@ install_pkgs() {
   bigecho "Installing required packages..."
   (
     set -x
-    apk add -U -q bash bind-tools coreutils openssl wget iproute2 sed grep \
-    libcap-ng libcurl libevent linux-pam musl nspr nss nss-tools \
+    apk add -U -q bash bind-tools coreutils openssl wget iptables iproute2 \
+    sed grep libcap-ng libcurl libevent linux-pam musl nspr nss nss-tools \
     bison flex gcc make libc-dev bsd-compat-headers linux-pam-dev nss-dev \
     libcap-ng-dev libevent-dev curl-dev nspr-dev uuidgen openrc
   ) || exiterr2
@@ -172,21 +172,23 @@ install_libreswan() {
   cd "libreswan-$SWAN_VER" || exit 1
   sed -i '1c\#!/sbin/openrc-run' /etc/init.d/ipsec
   service ipsec stop >/dev/null 2>&1
-  sed -i '28s/stdlib\.h/sys\/types.h/' include/fd.h
 cat > Makefile.inc.local <<'EOF'
 WERROR_CFLAGS=-w -s
 USE_DNSSEC=false
 USE_DH2=true
 FINALNSSDIR=/etc/ipsec.d
-USE_GLIBC_KERN_FLIP_HEADERS=true
+NSSDIR=/etc/ipsec.d
 EOF
+  if [ "$SWAN_VER" = "4.5" ] || [ "$SWAN_VER" = "4.6" ] \
+    || [ "$SWAN_VER" = "4.7" ]; then
+    echo "USE_GLIBC_KERN_FLIP_HEADERS=true" >> Makefile.inc.local
+  fi
   NPROCS=$(grep -c ^processor /proc/cpuinfo)
   [ -z "$NPROCS" ] && NPROCS=1
   (
     set -x
-    make "-j$((NPROCS+1))" -s base >/dev/null && make -s install-base >/dev/null
+    make "-j$((NPROCS+1))" -s base >/dev/null 2>&1 && make -s install-base >/dev/null 2>&1
   )
-
   cd /opt/src || exit 1
   /bin/rm -rf "/opt/src/libreswan-$SWAN_VER"
   if ! /usr/local/sbin/ipsec --version 2>/dev/null | grep -qF "$SWAN_VER"; then
@@ -198,7 +200,7 @@ EOF
 update_ikev2_script() {
   bigecho "Updating IKEv2 script..."
   cd /opt/src || exit 1
-  ikev2_url="https://github.com/hwdsl2/setup-ipsec-vpn/raw/master/extras/ikev2setup.sh"
+  ikev2_url="https://raw.githubusercontent.com/hwdsl2/setup-ipsec-vpn/master/extras/ikev2setup.sh"
   (
     set -x
     wget -t 3 -T 30 -q -O ikev2.sh.new "$ikev2_url"
@@ -213,22 +215,19 @@ update_ikev2_script() {
 
 update_config() {
   bigecho "Updating VPN configuration..."
-  IKE_NEW="  ike=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,aes256-sha2;modp1024,aes128-sha1;modp1024"
+  IKE_NEW="  ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048"
   PHASE2_NEW="  phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes256-sha2_512,aes128-sha2,aes256-sha2"
-
   if uname -m | grep -qi '^arm'; then
     if ! modprobe -q sha512; then
       PHASE2_NEW="  phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes128-sha2,aes256-sha2"
     fi
   fi
-
   dns_state=0
   DNS_SRV1=$(grep "modecfgdns1=" /etc/ipsec.conf | head -n 1 | cut -d '=' -f 2)
   DNS_SRV2=$(grep "modecfgdns2=" /etc/ipsec.conf | head -n 1 | cut -d '=' -f 2)
   [ -n "$DNS_SRV1" ] && dns_state=2
   [ -n "$DNS_SRV1" ] && [ -n "$DNS_SRV2" ] && dns_state=1
   [ "$(grep -c "modecfgdns1=" /etc/ipsec.conf)" -gt "1" ] && dns_state=3
-
   sed -i".old-$SYS_DT" \
       -e "s/^[[:space:]]\+auth=/  phase2=/" \
       -e "s/^[[:space:]]\+forceencaps=/  encapsulation=/" \
@@ -237,17 +236,17 @@ update_config() {
       -e "s/^[[:space:]]\+sha2-truncbug=yes/  sha2-truncbug=no/" \
       -e "s/^[[:space:]]\+ike=.\+/$IKE_NEW/" \
       -e "s/^[[:space:]]\+phase2alg=.\+/$PHASE2_NEW/" /etc/ipsec.conf
-
-  if [ "$dns_state" = "1" ]; then
+  if [ "$dns_state" = 1 ]; then
     sed -i -e "s/^[[:space:]]\+modecfgdns1=.\+/  modecfgdns=\"$DNS_SRV1 $DNS_SRV2\"/" \
         -e "/modecfgdns2=/d" /etc/ipsec.conf
-  elif [ "$dns_state" = "2" ]; then
+  elif [ "$dns_state" = 2 ]; then
     sed -i "s/^[[:space:]]\+modecfgdns1=.\+/  modecfgdns=$DNS_SRV1/" /etc/ipsec.conf
   fi
-
   sed -i "/ikev2=never/d" /etc/ipsec.conf
   sed -i "/conn shared/a \  ikev2=never" /etc/ipsec.conf
-
+  if ! grep -qs "ikev1-policy" /etc/ipsec.conf; then
+    sed -i "/config setup/a \  ikev1-policy=accept" /etc/ipsec.conf
+  fi
   if grep -qs ike-frag /etc/ipsec.d/ikev2.conf; then
     sed -i".old-$SYS_DT" 's/^[[:space:]]\+ike-frag=/  fragmentation=/' /etc/ipsec.d/ikev2.conf
   fi
@@ -270,8 +269,7 @@ Libreswan $SWAN_VER has been successfully installed!
 ================================================
 
 EOF
-
-  if [ "$dns_state" = "3" ]; then
+  if [ "$dns_state" = 3 ]; then
 cat <<'EOF'
 IMPORTANT: You must edit /etc/ipsec.conf and replace
            all occurrences of these two lines:
